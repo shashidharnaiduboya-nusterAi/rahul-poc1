@@ -1,13 +1,12 @@
 """
-run_test.py -- Standalone E2E Test Runner with Groq LLM (v2)
-=============================================================
+run_test.py -- Standalone E2E Retrieval Test Runner
+====================================================
 Pipeline:
-  1. Parse XLSX ground truth (alert → PG doc → section)
+  1. Parse XLSX ground truth (alert → expected PG docs)
   2. Index all B&F PG docs (embedding + BM25)
   3. Hybrid retrieval: semantic + BM25 combined scoring
-  4. Groq/Llama guardrail: LLM filters out false positives
-  5. Section-level matching: Groq identifies impacted sections
-  6. Evaluation: doc-level + section-level P / R / F1
+  4. Cross-encoder reranking
+  5. Report: for each alert, show expected vs retrieved docs
 
 Usage:
     python3 run_test.py
@@ -463,26 +462,6 @@ def match_sections_sequential(alert_title, key_terms, pg_title, sections):
     return matched
 
 
-# ═══════════════════════════════════════════════════════════════════
-# 9. Evaluation Helpers
-# ═══════════════════════════════════════════════════════════════════
-def _norm(s): return re.sub(r"[^a-z0-9 ]", "", s.lower()).strip()
-
-def section_heading_matches(pred, exp):
-    if not pred or not exp: return False
-    pn, en = _norm(pred), _norm(exp)
-    if not pn or not en: return False
-    if pn == en or pn in en or en in pn: return True
-    pw, ew = set(pn.split()), set(en.split())
-    if len(pw) < 2 or len(ew) < 2: return False
-    return len(pw & ew) / min(len(pw), len(ew)) >= 0.5
-
-def compute_metrics(tp, fp, fn):
-    p = tp / (tp + fp) if (tp + fp) else 0.0
-    r = tp / (tp + fn) if (tp + fn) else 0.0
-    f = 2*p*r/(p+r) if (p+r) else 0.0
-    return {"precision": round(p, 4), "recall": round(r, 4), "f1": round(f, 4),
-            "tp": tp, "fp": fp, "fn": fn}
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -503,11 +482,11 @@ def main():
     t0 = time.time()
     P = lambda *a, **kw: print(*a, **kw, flush=True)
     P("=" * 70)
-    P("  POC-1 E2E TEST v3 — Multi-Query + Keyword + CrossEncoder")
+    P("  POC-1 Retrieval Test")
     P("=" * 70)
 
     # ── 1. Ground truth ───────────────────────────────────────────
-    P(f"\n[1/6] Parsing XLSX ground truth...")
+    P(f"\n[1/5] Parsing XLSX ground truth...")
     gt_entries, no_impact_lnis = parse_ground_truth(XLSX_PATH)
     alert_gt = build_alert_ground_truth(gt_entries)
     echo_to_gt_titles = {}
@@ -519,7 +498,7 @@ def main():
     P(f"  {len(alert_gt)} alerts | {total_gt_docs} doc mappings | {total_gt_secs} section mappings")
 
     # ── 2. Parse PG docs ──────────────────────────────────────────
-    P(f"\n[2/6] Parsing PG docs from {PG_DOCS_DIR.name}...")
+    P(f"\n[2/5] Parsing PG docs from {PG_DOCS_DIR.name}...")
     xml_files = sorted(PG_DOCS_DIR.rglob("*.xml"))
     docs, echo_to_doc, errs = [], {}, 0
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
@@ -534,7 +513,7 @@ def main():
     P(f"  {len(docs)} docs parsed ({errs} errors) | GT coverage: {len(cov)}/{len(gt_eids)}")
 
     # ── 3. Index (embeddings + BM25) ──────────────────────────────
-    P(f"\n[3/6] Building indexes...")
+    P(f"\n[3/5] Building indexes...")
     model = index_pg_docs(docs, TEST_QDRANT_DIR, batch_size=64)
     bm25_idx = BM25Index(docs)
     P(f"  BM25 index: {len(docs)} docs")
@@ -544,8 +523,7 @@ def main():
     # ── 4. Retrieve + guardrail + sections ────────────────────────
     alerts_to_run = list(alert_gt.items())
     if args.max_alerts > 0: alerts_to_run = alerts_to_run[:args.max_alerts]
-    P(f"\n[4/6] Running {len(alerts_to_run)} alerts "
-      f"(top_k={args.top_k}, α={args.alpha}, thr={args.threshold})")
+    P(f"\n[4/5] Running retrieval for {len(alerts_to_run)} alerts...")
 
     results: list[AlertResult] = []
     total_groq = 0
@@ -560,19 +538,19 @@ def main():
                                gt["title"], gt["key_terms"],
                                top_k=args.top_k * 2, threshold=args.threshold,
                                alpha=args.alpha, echo_to_doc=echo_to_doc)
-        P(f"    Hybrid candidates: {len(hits)}")
+        P(f"    Initial candidates: {len(hits)}")
 
         if not args.skip_rerank and hits:
             alert_text = f"{gt['title']} {gt['key_terms']}"
             hits = cross_encoder_rerank(alert_text, hits, echo_to_doc, top_k=args.top_k)
-            P(f"    After cross-encoder rerank: {len(hits)}")
+            P(f"    After reranking: {len(hits)}")
 
         if not args.skip_guardrail and hits:
             pre = len(hits)
             hits = guardrail_filter(gt["title"], gt["key_terms"], hits, echo_to_doc,
                                     workers=min(6, len(hits)))
             total_groq += pre
-            P(f"    Guardrail: {pre} → {len(hits)} kept")
+            P(f"    After guardrail: {pre} → {len(hits)} kept")
 
         ar = AlertResult(alert_lni=lni, alert_title=gt["title"], key_terms=gt["key_terms"],
                          expected_doc_ids=set(gt["expected_docs"].keys()),
@@ -583,13 +561,10 @@ def main():
         ar.doc_tp = len(ar.predicted_doc_ids & ar.expected_doc_ids)
         ar.doc_fp = len(ar.predicted_doc_ids - ar.expected_doc_ids)
         ar.doc_fn = len(ar.expected_doc_ids - ar.predicted_doc_ids)
-        P(f"    Doc TP={ar.doc_tp} FP={ar.doc_fp} FN={ar.doc_fn}")
 
-        for h in hits[:5]:
-            tag = "TP" if h["echo_id"] in ar.expected_doc_ids else "FP"
-            P(f"      [{tag}] echo:{h['echo_id']:<10} "
-              f"score={h['score']:.3f} (sem={h.get('sem_score',0):.3f} "
-              f"bm25={h.get('bm25_score',0):.3f}) | {h['title'][:45]}")
+        P(f"    Retrieved {len(hits)} docs:")
+        for h in hits:
+            P(f"      doc_id: {h['echo_id']:<10} | score: {h['score']:.3f} | {h['title'][:55]}")
 
         if not args.skip_sections:
             for h in hits:
@@ -601,282 +576,85 @@ def main():
                 if matched:
                     ar.predicted_sections[h["echo_id"]] = [m["heading"] for m in matched]
 
-            for eid, exp_heads in ar.expected_sections.items():
-                pred_heads = ar.predicted_sections.get(eid, [])
-                for eh in exp_heads:
-                    if any(section_heading_matches(ph, eh) for ph in pred_heads):
-                        ar.sec_tp += 1
-                    else: ar.sec_fn += 1
-            for eid, pred_heads in ar.predicted_sections.items():
-                exp_heads = ar.expected_sections.get(eid, [])
-                for ph in pred_heads:
-                    if not any(section_heading_matches(ph, eh) for eh in exp_heads):
-                        ar.sec_fp += 1
-            P(f"    Sec TP={ar.sec_tp} FP={ar.sec_fp} FN={ar.sec_fn}")
-
         results.append(ar)
 
     t_ret = time.time()
-
-    # ── 5. Aggregate ──────────────────────────────────────────────
-    P(f"\n[5/6] Computing metrics & analysis...")
-    d_tp = sum(r.doc_tp for r in results); d_fp = sum(r.doc_fp for r in results)
-    d_fn = sum(r.doc_fn for r in results)
-    dm = compute_metrics(d_tp, d_fp, d_fn)
-    s_tp = sum(r.sec_tp for r in results); s_fp = sum(r.sec_fp for r in results)
-    s_fn = sum(r.sec_fn for r in results)
-    sm = compute_metrics(s_tp, s_fp, s_fn)
-
-    # ── Score distribution analysis ──────────────────────────────
-    all_tp_scores, all_fp_scores = [], []
-    per_alert_analysis = []
-    alerts_perfect_recall = 0
-    alerts_zero_recall = 0
-    alerts_with_fn_no_xml = 0
-
-    for r in results:
-        tp_scores = [r.retrieval_scores[e] for e in r.predicted_doc_ids & r.expected_doc_ids
-                     if e in r.retrieval_scores]
-        fp_scores = [r.retrieval_scores[e] for e in r.predicted_doc_ids - r.expected_doc_ids
-                     if e in r.retrieval_scores]
-        all_tp_scores.extend(tp_scores)
-        all_fp_scores.extend(fp_scores)
-
-        rm = compute_metrics(r.doc_tp, r.doc_fp, r.doc_fn)
-        if rm["recall"] >= 1.0: alerts_perfect_recall += 1
-        if rm["recall"] == 0.0 and (r.doc_tp + r.doc_fn) > 0: alerts_zero_recall += 1
-
-        fn_missing_xml = sum(1 for e in r.expected_doc_ids - r.predicted_doc_ids
-                             if e not in avail_eids)
-        if fn_missing_xml > 0: alerts_with_fn_no_xml += 1
-
-        score_gap = 0.0
-        if tp_scores and fp_scores:
-            score_gap = min(tp_scores) - max(fp_scores)
-
-        per_alert_analysis.append({
-            "alert_lni": r.alert_lni,
-            "tp_score_min": round(min(tp_scores), 4) if tp_scores else None,
-            "tp_score_max": round(max(tp_scores), 4) if tp_scores else None,
-            "tp_score_mean": round(float(np.mean(tp_scores)), 4) if tp_scores else None,
-            "fp_score_min": round(min(fp_scores), 4) if fp_scores else None,
-            "fp_score_max": round(max(fp_scores), 4) if fp_scores else None,
-            "fp_score_mean": round(float(np.mean(fp_scores)), 4) if fp_scores else None,
-            "tp_fp_gap": round(score_gap, 4),
-            "fn_missing_xml": fn_missing_xml,
-        })
-
-    score_analysis = {
-        "tp_scores": {
-            "count": len(all_tp_scores),
-            "min": round(min(all_tp_scores), 4) if all_tp_scores else None,
-            "max": round(max(all_tp_scores), 4) if all_tp_scores else None,
-            "mean": round(float(np.mean(all_tp_scores)), 4) if all_tp_scores else None,
-            "median": round(float(np.median(all_tp_scores)), 4) if all_tp_scores else None,
-            "p25": round(float(np.percentile(all_tp_scores, 25)), 4) if all_tp_scores else None,
-            "p75": round(float(np.percentile(all_tp_scores, 75)), 4) if all_tp_scores else None,
-        },
-        "fp_scores": {
-            "count": len(all_fp_scores),
-            "min": round(min(all_fp_scores), 4) if all_fp_scores else None,
-            "max": round(max(all_fp_scores), 4) if all_fp_scores else None,
-            "mean": round(float(np.mean(all_fp_scores)), 4) if all_fp_scores else None,
-            "median": round(float(np.median(all_fp_scores)), 4) if all_fp_scores else None,
-            "p25": round(float(np.percentile(all_fp_scores, 25)), 4) if all_fp_scores else None,
-            "p75": round(float(np.percentile(all_fp_scores, 75)), 4) if all_fp_scores else None,
-        },
-        "overlap_zone": None,
-    }
-    if all_tp_scores and all_fp_scores:
-        overlap_low = max(min(all_tp_scores), min(all_fp_scores))
-        overlap_high = min(max(all_tp_scores), max(all_fp_scores))
-        if overlap_low < overlap_high:
-            score_analysis["overlap_zone"] = {
-                "low": round(overlap_low, 4), "high": round(overlap_high, 4),
-                "note": "TP and FP scores overlap in this range — hard to separate by threshold alone"
-            }
-
-    # ── Takeaways ─────────────────────────────────────────────────
-    takeaways = []
-    total_expected = d_tp + d_fn
-    gt_missing = len(gt_eids - avail_eids)
-    fn_from_missing = sum(a["fn_missing_xml"] for a in per_alert_analysis)
-
-    takeaways.append(f"Ground truth has {total_expected} expected doc mappings across {len(results)} alerts.")
-    takeaways.append(f"{gt_missing} of {len(gt_eids)} unique expected echo_ids have NO XML file "
-                     f"({fn_from_missing} FN attributable to missing files).")
-    takeaways.append(f"{alerts_perfect_recall}/{len(results)} alerts achieved 100% recall; "
-                     f"{alerts_zero_recall}/{len(results)} alerts had 0% recall.")
-
-    if all_tp_scores and all_fp_scores:
-        takeaways.append(f"TP score range: {min(all_tp_scores):.3f}–{max(all_tp_scores):.3f} "
-                         f"(mean {np.mean(all_tp_scores):.3f}). "
-                         f"FP score range: {min(all_fp_scores):.3f}–{max(all_fp_scores):.3f} "
-                         f"(mean {np.mean(all_fp_scores):.3f}).")
-        if score_analysis["overlap_zone"]:
-            takeaways.append(f"TP/FP overlap zone: {score_analysis['overlap_zone']['low']:.3f}–"
-                             f"{score_analysis['overlap_zone']['high']:.3f}. "
-                             f"Threshold tuning alone cannot fully separate TPs from FPs.")
-        else:
-            takeaways.append("No TP/FP score overlap — a threshold can cleanly separate TPs from FPs.")
-
-    if d_fp > d_tp * 3:
-        takeaways.append(f"PRECISION BOTTLENECK: {d_fp} FPs vs {d_tp} TPs. "
-                         f"BM25 generic legal keywords (default, finance, security) likely cause noise.")
-    if d_fn > total_expected * 0.4:
-        takeaways.append(f"RECALL GAP: {d_fn}/{total_expected} expected docs missed. "
-                         f"Embedding model may not capture domain-specific relevance for some topics.")
-
-    # ── Build JSON report ─────────────────────────────────────────
     t_end = time.time()
+
+    # ── Build clean JSON report (SME-friendly) ────────────────────
     echo_info = {d.echo_id: {"doc_id": d.doc_id, "title": d.title} for d in docs}
 
     report = {
         "generated_at": datetime.now().isoformat(),
-        "config": {"embedding": "all-MiniLM-L6-v2",
-                   "cross_encoder": "ms-marco-MiniLM-L-6-v2" if not args.skip_rerank else "OFF",
-                   "llm": GROQ_MODEL, "multi_query": True, "keyword_reranker": True,
-                   "top_k": args.top_k, "threshold": args.threshold, "alpha": args.alpha,
-                   "guardrail": not args.skip_guardrail, "sections": not args.skip_sections,
-                   "pg_docs": len(docs), "alerts_tested": len(results)},
-        "timing": {"total_s": round(t_end-t0,1), "index_s": round(t_index-t0,1),
-                   "retrieval_s": round(t_ret-t_index,1), "groq_calls": total_groq},
-        "doc_metrics": dm, "sec_metrics": sm,
-        "score_analysis": score_analysis,
-        "key_takeaways": takeaways,
-        "gt_coverage": {"expected_unique_echo_ids": len(gt_eids),
-                        "available_in_xml": len(cov),
-                        "missing_count": gt_missing,
-                        "missing_echo_ids": sorted(gt_eids - avail_eids),
-                        "fn_from_missing_files": fn_from_missing},
-        "alert_summary": {
-            "total": len(results),
-            "perfect_recall": alerts_perfect_recall,
-            "zero_recall": alerts_zero_recall,
-            "have_fn_due_to_missing_xml": alerts_with_fn_no_xml,
+        "config": {
+            "total_pg_docs_indexed": len(docs),
+            "total_alerts_tested": len(results),
+            "top_k": args.top_k,
+            "similarity_threshold": args.threshold,
         },
-        "per_alert": [],
+        "timing": {
+            "total_seconds": round(t_end - t0, 1),
+            "indexing_seconds": round(t_index - t0, 1),
+            "retrieval_seconds": round(t_ret - t_index, 1),
+        },
+        "results": [],
     }
-    for idx, r in enumerate(results):
-        exp_rich = [{"echo_id": e, "doc_id": echo_info.get(e,{}).get("doc_id",""),
-                     "title": echo_to_gt_titles.get(e,""),
-                     "has_xml": e in avail_eids}
-                    for e in sorted(r.expected_doc_ids)]
-        pred_rich = [{"echo_id": e, "doc_id": echo_info.get(e,{}).get("doc_id",""),
-                      "title": echo_info.get(e,{}).get("title","?"),
-                      "score": r.retrieval_scores.get(e,0),
-                      "correct": e in r.expected_doc_ids}
-                     for e in sorted(r.retrieval_scores, key=lambda x: -r.retrieval_scores[x])]
-        entry = {"alert_lni": r.alert_lni, "alert_title": r.alert_title,
-                 "key_terms": r.key_terms, "expected_docs": exp_rich,
-                 "predicted_docs": pred_rich,
-                 "doc_tp": r.doc_tp, "doc_fp": r.doc_fp, "doc_fn": r.doc_fn,
-                 "doc_metrics": compute_metrics(r.doc_tp, r.doc_fp, r.doc_fn),
-                 "score_analysis": per_alert_analysis[idx]}
-        if not args.skip_sections:
-            entry["expected_sections"] = {k:v for k,v in r.expected_sections.items() if v}
-            entry["predicted_sections"] = r.predicted_sections
-            entry["sec_tp"] = r.sec_tp; entry["sec_fp"] = r.sec_fp; entry["sec_fn"] = r.sec_fn
-            entry["sec_metrics"] = compute_metrics(r.sec_tp, r.sec_fp, r.sec_fn)
-        report["per_alert"].append(entry)
+
+    for r in results:
+        retrieved = []
+        for eid in sorted(r.retrieval_scores, key=lambda x: -r.retrieval_scores[x]):
+            inf = echo_info.get(eid, {})
+            retrieved.append({
+                "doc_id": inf.get("doc_id", eid),
+                "title": inf.get("title", ""),
+                "relevance_score": round(r.retrieval_scores[eid], 4),
+            })
+
+        expected = []
+        for eid in sorted(r.expected_doc_ids):
+            inf = echo_info.get(eid, {})
+            expected.append({
+                "doc_id": inf.get("doc_id", eid),
+                "title": echo_to_gt_titles.get(eid, inf.get("title", "")),
+            })
+
+        report["results"].append({
+            "alert_lni": r.alert_lni,
+            "alert_title": r.alert_title,
+            "key_terms": r.key_terms,
+            "expected_pg_docs": expected,
+            "retrieved_pg_docs": retrieved,
+        })
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    rp = REPORT_DIR / f"test_report_v3_{ts}.json"
+    rp = REPORT_DIR / f"test_report_{ts}.json"
     with open(rp, "w") as f: json.dump(report, f, indent=2, ensure_ascii=False)
 
-    # ── Print human-readable summary ──────────────────────────────
+    # ── Print clean summary ───────────────────────────────────────
     P("\n" + "=" * 70)
-    P("  E2E TEST REPORT v3")
+    P("  RETRIEVAL TEST REPORT")
     P("=" * 70)
-    P(f"  Embedding : all-MiniLM-L6-v2 | CrossEncoder: {'ON' if not args.skip_rerank else 'OFF'}")
-    P(f"  Pipeline  : Multi-Query + BM25(α={args.alpha}) + KeywordBoost + CrossEncoder")
-    P(f"  top_k={args.top_k} | threshold={args.threshold}")
-    P(f"  PG docs   : {len(docs)} | Alerts: {len(results)} | Groq calls: ~{total_groq}")
-    P(f"  Time      : {t_end-t0:.1f}s (index={t_index-t0:.1f}s, retrieval={t_ret-t_index:.1f}s)")
+    P(f"  PG Documents Indexed : {len(docs)}")
+    P(f"  Alerts Tested        : {len(results)}")
+    P(f"  Time                 : {t_end - t0:.1f}s")
+    P("")
 
-    P(f"\n  DOCUMENT-LEVEL:")
-    P(f"    Precision: {dm['precision']:.4f} ({d_tp}/{d_tp+d_fp})")
-    P(f"    Recall   : {dm['recall']:.4f} ({d_tp}/{d_tp+d_fn})")
-    P(f"    F1       : {dm['f1']:.4f}  |  TP={d_tp} FP={d_fp} FN={d_fn}")
-
-    if not args.skip_sections:
-        P(f"\n  SECTION-LEVEL:")
-        P(f"    Precision: {sm['precision']:.4f} ({s_tp}/{s_tp+s_fp})")
-        P(f"    Recall   : {sm['recall']:.4f} ({s_tp}/{s_tp+s_fn})")
-        P(f"    F1       : {sm['f1']:.4f}  |  TP={s_tp} FP={s_fp} FN={s_fn}")
-
-    P(f"\n  SCORE DISTRIBUTION (TP vs FP):")
-    sa = score_analysis
-    if sa["tp_scores"]["count"]:
-        P(f"    TP scores : n={sa['tp_scores']['count']}  "
-          f"min={sa['tp_scores']['min']}  median={sa['tp_scores']['median']}  "
-          f"mean={sa['tp_scores']['mean']}  max={sa['tp_scores']['max']}  "
-          f"[p25={sa['tp_scores']['p25']} p75={sa['tp_scores']['p75']}]")
-    else:
-        P(f"    TP scores : (none)")
-    if sa["fp_scores"]["count"]:
-        P(f"    FP scores : n={sa['fp_scores']['count']}  "
-          f"min={sa['fp_scores']['min']}  median={sa['fp_scores']['median']}  "
-          f"mean={sa['fp_scores']['mean']}  max={sa['fp_scores']['max']}  "
-          f"[p25={sa['fp_scores']['p25']} p75={sa['fp_scores']['p75']}]")
-    else:
-        P(f"    FP scores : (none)")
-    if sa["overlap_zone"]:
-        P(f"    Overlap   : {sa['overlap_zone']['low']}–{sa['overlap_zone']['high']} "
-          f"(cannot separate by threshold alone)")
-    else:
-        P(f"    Overlap   : NONE — clean threshold separation possible")
-
-    P(f"\n  ALERT SUMMARY:")
-    P(f"    Perfect recall (100%): {alerts_perfect_recall}/{len(results)}")
-    P(f"    Zero recall (0%)    : {alerts_zero_recall}/{len(results)}")
-    P(f"    FNs from missing XML: {fn_from_missing} across {alerts_with_fn_no_xml} alerts")
-
-    P(f"\n  KEY TAKEAWAYS:")
-    for j, t in enumerate(takeaways, 1):
-        P(f"    {j}. {t}")
-
-    P(f"\n  PER-ALERT (sorted by recall):")
-    hdr = (f"  {'LNI':<36} {'Title':<28} {'P':>5} {'R':>5} {'F1':>5}"
-           f" {'TP':>3} {'FP':>3} {'FN':>3}  {'TP_avg':>7} {'FP_avg':>7} {'Gap':>6}")
-    P(hdr); P(f"  {'-'*(len(hdr)-2)}")
-    for idx, r in enumerate(sorted(results,
-            key=lambda x: compute_metrics(x.doc_tp,x.doc_fp,x.doc_fn)["recall"])):
-        m = compute_metrics(r.doc_tp, r.doc_fp, r.doc_fn)
-        pa = next(a for a in per_alert_analysis if a["alert_lni"] == r.alert_lni)
-        tp_avg = f"{pa['tp_score_mean']:.3f}" if pa["tp_score_mean"] is not None else "   -  "
-        fp_avg = f"{pa['fp_score_mean']:.3f}" if pa["fp_score_mean"] is not None else "   -  "
-        gap = f"{pa['tp_fp_gap']:+.3f}" if pa["tp_score_mean"] is not None and pa["fp_score_mean"] is not None else "   -  "
-        P(f"  {r.alert_lni:<36} {r.alert_title[:28]:<28} {m['precision']:>5.2f} "
-          f"{m['recall']:>5.2f} {m['f1']:>5.2f} {r.doc_tp:>3} {r.doc_fp:>3} {r.doc_fn:>3}"
-          f"  {tp_avg:>7} {fp_avg:>7} {gap:>6}")
-
-    P(f"\n  MISSED DOCS (FN):")
-    mc = 0
     for r in results:
-        for eid in r.expected_doc_ids - r.predicted_doc_ids:
-            mc += 1
-            has_xml = "✓" if eid in avail_eids else "✗ NO XML"
-            if mc <= 25:
-                inf = echo_info.get(eid, {})
-                P(f"    {r.alert_lni[:26]} | echo:{eid:<10} | "
-                  f"doc:{inf.get('doc_id','N/A')[:30]} | {echo_to_gt_titles.get(eid,'?')[:35]} | {has_xml}")
-    if mc > 25: P(f"    ... +{mc-25} more")
+        P(f"  Alert: {r.alert_lni}")
+        P(f"    Title : {r.alert_title[:70]}")
+        P(f"    Terms : {r.key_terms[:70]}")
+        P(f"    Expected PG docs ({len(r.expected_doc_ids)}):")
+        for eid in sorted(r.expected_doc_ids):
+            inf = echo_info.get(eid, {})
+            P(f"      - doc_id: {inf.get('doc_id', eid):<12} | {echo_to_gt_titles.get(eid, '')[:55]}")
+        P(f"    Retrieved PG docs ({len(r.retrieval_scores)}):")
+        for eid in sorted(r.retrieval_scores, key=lambda x: -r.retrieval_scores[x]):
+            inf = echo_info.get(eid, {})
+            P(f"      - doc_id: {inf.get('doc_id', eid):<12} | score: {r.retrieval_scores[eid]:.3f} | {inf.get('title','')[:45]}")
+        P("")
 
-    P(f"\n  CORRECT RETRIEVALS (TP):")
-    tc = 0
-    for r in results:
-        for eid in r.predicted_doc_ids & r.expected_doc_ids:
-            tc += 1
-            if tc <= 25:
-                inf = echo_info.get(eid, {})
-                P(f"    {r.alert_lni[:26]} | echo:{eid:<10} | "
-                  f"doc:{inf.get('doc_id','?')[:30]} | {inf.get('title','?')[:35]} | "
-                  f"score={r.retrieval_scores.get(eid,0):.3f}")
-    if tc > 25: P(f"    ... +{tc-25} more")
-
-    P(f"\n  Report: {rp}")
+    P(f"  Report saved: {rp}")
     P("=" * 70)
 
 if __name__ == "__main__":
