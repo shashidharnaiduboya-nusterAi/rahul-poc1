@@ -73,60 +73,13 @@ class GuardrailAgent(BaseAgent):
             )
             return
 
-        case_excerpts = _build_case_excerpts(candidates, case_chunks)
-        case_summary_brief = case_summary[:2_000] if case_summary else "(No summary)"
-
-        filtered: list[dict] = []
-        rejected = 0
-
-        print(f"  [Guardrail] Evaluating {len(candidates)} candidate PG docs...")
-
-        for i, doc in enumerate(candidates):
-            pg_title = doc.get("doc_title", "")
-            pg_summary = doc.get("doc_summary", "") or pg_title
-            pg_practice = doc.get("practice_area", "")
-
-            user_msg = GUARDRAIL_USER_TEMPLATE.format(
-                case_excerpts=case_excerpts,
-                case_summary_brief=case_summary_brief,
-                case_citation=case_citation or "N/A",
-                pg_doc_title=pg_title,
-                pg_practice_area=pg_practice or "N/A",
-                pg_doc_summary=pg_summary[:1_500],
-            )
-
-            try:
-                raw = call_llm_json(
-                    system=GUARDRAIL_SYSTEM,
-                    user=user_msg,
-                    model_type="fast",
-                )
-                result = json.loads(raw)
-
-                is_relevant = result.get("is_relevant", False)
-                confidence = result.get("confidence", "LOW")
-                reason = result.get("reason", "")
-
-                if is_relevant and confidence in ("HIGH", "MEDIUM"):
-                    filtered.append(doc)
-                    print(f"  [Guardrail]   [{i+1}] PASS ({confidence}): "
-                          f"{pg_title[:50]} -- {reason[:80]}")
-                else:
-                    rejected += 1
-                    print(f"  [Guardrail]   [{i+1}] REJECT ({confidence}): "
-                          f"{pg_title[:50]} -- {reason[:80]}")
-
-            except (json.JSONDecodeError, Exception) as exc:
-                filtered.append(doc)
-                print(f"  [Guardrail]   [{i+1}] ERROR (passing through): {exc}")
+        # Guardrail disabled — pass all candidates through to matching
+        filtered = list(candidates)
+        print(f"  [Guardrail] Passing all {len(filtered)} candidates through (guardrail disabled)")
 
         state["candidate_pg_docs"] = filtered
 
-        summary = (
-            f"Guardrail: {len(filtered)} passed, {rejected} rejected "
-            f"(from {len(candidates)} candidates)"
-        )
-        print(f"  [Guardrail] {summary}")
+        summary = f"Guardrail: {len(filtered)} candidates passed through (guardrail disabled)"
 
         yield Event(
             author=self.name,

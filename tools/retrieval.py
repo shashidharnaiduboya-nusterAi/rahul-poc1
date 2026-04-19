@@ -24,13 +24,13 @@ from qdrant_client import QdrantClient
 
 PG_DOC_COLL = "pg_doc_index"
 
-_DEFAULT_SIM_THRESHOLD = 0.50
-_DEFAULT_TOP_K = 15
-_DEFAULT_SCORE_GAP = 0.06
+_DEFAULT_SIM_THRESHOLD = 0.30
+_DEFAULT_TOP_K = 25
+_DEFAULT_SCORE_GAP = 0.08
 
-_DEFAULT_L0_LIMIT = 80
-_DEFAULT_L1_LIMIT = 40
-_DEFAULT_L2_PER_PARA_LIMIT = 8
+_DEFAULT_L0_LIMIT = 100
+_DEFAULT_L1_LIMIT = 50
+_DEFAULT_L2_PER_PARA_LIMIT = 10
 _MAX_PARA_QUERIES = 20
 
 _STOPWORDS = frozenset({
@@ -439,7 +439,7 @@ def three_level_retrieve(
     # ======================================================================
     print("  [Retriever] === Final scoring ===")
 
-    min_query_hits = int(os.getenv("RETRIEVAL_MIN_HITS", "2"))
+    min_query_hits = int(os.getenv("RETRIEVAL_MIN_HITS", "1"))
 
     results_list: list[dict] = []
     for doc_id, scores in doc_scores.items():
