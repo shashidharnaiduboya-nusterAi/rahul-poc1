@@ -349,41 +349,17 @@ def parse_courtcase(xml_path) -> dict:
 # ===========================================================================
 def _extract_pg_doc_id(root, xml_path: Path) -> str:
     """
-    Extract a stable doc_id from PG XML content, falling back to filename.
+    Extract doc_id from the filename stem (number before the em-dash).
 
-    Priority:
-    1. <identifier identifier-scheme="DOC-ID"> or scheme="LNI"
-    2. <docid> or <document-id> element text
-    3. First normcite on a <cite> element
-    4. Filename stem (normalized: strip em-dashes, special chars -> underscore)
+    Example: '140374—Repayment, prepayment and cancellation.xml' -> '140374'
+
+    Falls back to full normalized filename stem if no em-dash is found.
     """
-    ns_meta = NS_LNMETA
-
-    for elem in root.iter():
-        lname = local_name(elem.tag)
-        if lname == "identifier":
-            scheme = (
-                elem.attrib.get(f"{{{ns_meta}}}identifier-scheme", "")
-                or elem.attrib.get("identifier-scheme", "")
-            ).upper()
-            if scheme in ("DOC-ID", "LNI", "PGDOC-ID") and elem.text and elem.text.strip():
-                return elem.text.strip()
-
-    for elem in root.iter():
-        lname = local_name(elem.tag)
-        if lname in ("docid", "document-id", "documentid"):
-            if elem.text and elem.text.strip():
-                return elem.text.strip()
-
-    for elem in root.iter():
-        if local_name(elem.tag) == "cite":
-            nc = elem.attrib.get("normcite", "").strip()
-            if nc:
-                return nc
-
     stem = xml_path.stem.split("\u2014")[0].strip()
-    normalized = re.sub(r"[^\w\-.]", "_", stem).strip("_")
-    return normalized if normalized else xml_path.stem
+    if stem:
+        normalized = re.sub(r"[^\w\-.]", "_", stem).strip("_")
+        return normalized if normalized else xml_path.stem
+    return xml_path.stem
 
 
 def parse_pgdoc(xml_path) -> dict:
@@ -453,20 +429,38 @@ def parse_pgdoc(xml_path) -> dict:
             areas.append(area)
     practice_area = ", ".join(areas)
 
-    candidates: list[str] = []
+    structural_tags = {"clause", "inclusion", "section"}
+    leaf_elems = []
     for elem in root.iter():
-        if local_name(elem.tag) in ("clause", "inclusion", "para"):
-            text = elem_text_recursive(elem).strip()
-            if text and len(text) > 30:
-                candidates.append(text)
+        lname = local_name(elem.tag)
+        if lname not in structural_tags:
+            continue
+        has_structural_child = any(
+            local_name(ch.tag) in structural_tags for ch in elem
+        )
+        if not has_structural_child:
+            leaf_elems.append(elem)
 
     seen_keys: set[str] = set()
     paragraphs: list[str] = []
-    for p in candidates:
-        key = p[:120]
-        if key not in seen_keys:
-            seen_keys.add(key)
-            paragraphs.append(p)
+
+    for elem in leaf_elems:
+        text = elem_text_recursive(elem).strip()
+        if text and len(text) > 30:
+            key = text[:150]
+            if key not in seen_keys:
+                seen_keys.add(key)
+                paragraphs.append(text)
+
+    if not paragraphs:
+        for elem in root.iter():
+            if local_name(elem.tag) in ("para", "pgrp", "p"):
+                text = elem_text_recursive(elem).strip()
+                if text and len(text) > 30:
+                    key = text[:150]
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        paragraphs.append(text)
 
     text_lines = [
         f"DOCUMENT TITLE: {doc_title}",
