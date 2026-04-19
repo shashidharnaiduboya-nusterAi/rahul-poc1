@@ -115,10 +115,27 @@ class ReasoningAgent(BaseAgent):
                     if isinstance(suggestion, list):
                         suggestion = suggestion[0] if suggestion else None
 
+                    if suggestion and isinstance(suggestion, dict):
+                        ct = (suggestion.get("change_type", "") or "").strip().upper()
+                        if ct not in ("UPDATE", "NEW", "REMOVE"):
+                            ct = "UPDATE"
+                        suggestion["change_type"] = ct
+
                     if (suggestion
                             and isinstance(suggestion, dict)
                             and suggestion.get("what_to_change", "").strip()
                             and suggestion.get("change_type", "").upper() != "NOTE"):
+
+                        where_quote = (suggestion.get("where", "") or "").strip()
+                        if where_quote and ct == "UPDATE":
+                            sec_text_lower = section.get("section_text", "").lower()
+                            if where_quote.lower() not in sec_text_lower:
+                                words = where_quote.lower().split()
+                                overlap = sum(1 for w in words if w in sec_text_lower)
+                                if len(words) > 3 and overlap / len(words) < 0.5:
+                                    print(f"  [ReasoningAgent]   {section['section_id']}: "
+                                          f"grounding failed — quoted text not in PG section")
+                                    continue
                         doc_suggestions.append({
                             "section_id": section["section_id"],
                             "section_heading": sec_heading,

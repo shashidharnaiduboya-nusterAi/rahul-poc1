@@ -2,6 +2,8 @@
 run.py -- CLI Runner for POC-1 Pipeline
 =========================================
 Runs the full ADK agent pipeline for a single alert XML file.
+After the pipeline completes, prints document-level Precision and Recall
+if ground truth is available.
 
 Usage:
     python3 run.py <path_to_alert_xml>
@@ -20,6 +22,65 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+
+DATA_DIR = Path(__file__).resolve().parent / "data"
+GT_PATH = DATA_DIR / "ground_truth.json"
+
+
+def _load_ground_truth() -> list[dict]:
+    if not GT_PATH.exists():
+        return []
+    with open(GT_PATH, encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, list) else data.get("cases", [])
+
+
+def _print_retrieval_metrics(final_report: dict) -> None:
+    """
+    If ground truth exists for this case, compute and print
+    document-level Precision and Recall (nothing else).
+    """
+    gt_list = _load_ground_truth()
+    if not gt_list:
+        return
+
+    case_id = final_report.get("case", {}).get("case_id", "")
+    lni_id = final_report.get("alert", {}).get("lni_id", "")
+
+    gt_entry = None
+    for entry in gt_list:
+        if entry.get("case_id") == case_id:
+            gt_entry = entry
+            break
+        if entry.get("alert_xml") and case_id in entry["alert_xml"]:
+            gt_entry = entry
+            break
+        if entry.get("lni_id") and entry["lni_id"] == lni_id:
+            gt_entry = entry
+            break
+
+    if not gt_entry:
+        return
+
+    expected_docs = set(gt_entry.get("expected_pg_docs", []))
+    predicted_docs = set(
+        d["pg_doc_id"] for d in final_report.get("impacted_documents", [])
+    )
+
+    n_correct = len(predicted_docs & expected_docs)
+    n_retrieved = len(predicted_docs)
+    n_expected = len(expected_docs)
+
+    precision = n_correct / n_retrieved * 100 if n_retrieved else 0.0
+    recall = n_correct / n_expected * 100 if n_expected else 0.0
+
+    print()
+    print("=" * 60)
+    print("  RETRIEVAL ACCURACY")
+    print("=" * 60)
+    print(f"  Precision : {precision:.1f}%  ({n_correct} correct out of {n_retrieved} retrieved)")
+    print(f"  Recall    : {recall:.1f}%  ({n_correct} correct out of {n_expected} expected)")
+    print("=" * 60)
 
 
 async def run_pipeline(alert_xml_path: str) -> dict:
@@ -75,6 +136,8 @@ async def run_pipeline(alert_xml_path: str) -> dict:
         out_file = report_path / f"report_{lni}.json"
         out_file.write_text(json.dumps(final_report, indent=2, default=str))
         print(f"\nReport saved to: {out_file}")
+
+        _print_retrieval_metrics(final_report)
 
     return final_report
 

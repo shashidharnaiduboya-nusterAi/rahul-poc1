@@ -498,71 +498,71 @@ def parse_pgdoc(xml_path) -> dict:
 # ===========================================================================
 def parse_pgdoc_sections(xml_path) -> list[dict]:
     """
-    Parse a PG XML into a list of sections/subsections for the Matching Agent.
-    Each section dict contains: section_id, heading, text, subsections[].
-    Falls back to paragraph-level splitting if no structural sections found.
+    Parse a PG XML into a list of sections for the Matching Agent.
+    Each section dict contains: section_id, heading, text.
+    Uses only leaf-level structural elements to avoid text duplication
+    from nested parent/child sections.
     """
     xml_path = Path(xml_path)
     root = ET.parse(str(xml_path)).getroot()
 
-    sections: list[dict] = []
-    section_idx = 0
+    structural_tags = {"clause", "inclusion", "section"}
 
+    leaf_elems = []
     for elem in root.iter():
         lname = local_name(elem.tag)
-        if lname in ("clause", "inclusion", "section"):
-            heading = ""
-            for child in elem:
-                if local_name(child.tag) in ("heading", "title", "text"):
-                    h = elem_text_recursive(child).strip()
-                    if h and len(h) < 200:
-                        heading = h
-                        break
+        if lname not in structural_tags:
+            continue
+        has_structural_child = any(
+            local_name(ch.tag) in structural_tags for ch in elem
+        )
+        if not has_structural_child:
+            leaf_elems.append(elem)
 
-            text = elem_text_recursive(elem).strip()
-            if not text or len(text) < 30:
-                continue
+    sections: list[dict] = []
+    seen_text_keys: set[str] = set()
 
-            subsections: list[dict] = []
-            sub_idx = 0
-            for child in elem:
-                child_lname = local_name(child.tag)
-                if child_lname in ("clause", "inclusion", "para", "section"):
-                    sub_text = elem_text_recursive(child).strip()
-                    if sub_text and len(sub_text) > 20:
-                        sub_heading = ""
-                        for sub_child in child:
-                            if local_name(sub_child.tag) in ("heading", "title"):
-                                sh = elem_text_recursive(sub_child).strip()
-                                if sh and len(sh) < 200:
-                                    sub_heading = sh
-                                    break
-                        subsections.append({
-                            "subsection_id": f"sec_{section_idx}_sub_{sub_idx}",
-                            "heading": sub_heading,
-                            "text": sub_text,
-                        })
-                        sub_idx += 1
+    for idx, elem in enumerate(leaf_elems):
+        heading = ""
+        for child in elem:
+            if local_name(child.tag) in ("heading", "title", "text"):
+                h = elem_text_recursive(child).strip()
+                if h and len(h) < 200:
+                    heading = h
+                    break
 
-            sections.append({
-                "section_id": f"sec_{section_idx}",
-                "heading": heading,
-                "text": text,
-                "subsections": subsections,
-            })
-            section_idx += 1
+        text = elem_text_recursive(elem).strip()
+        if not text or len(text) < 30:
+            continue
+
+        dedup_key = text[:150]
+        if dedup_key in seen_text_keys:
+            continue
+        seen_text_keys.add(dedup_key)
+
+        sections.append({
+            "section_id": f"sec_{idx}",
+            "heading": heading,
+            "text": text,
+            "subsections": [],
+        })
 
     if not sections:
+        para_idx = 0
         for elem in root.iter():
             if local_name(elem.tag) in ("para", "pgrp", "p"):
                 text = elem_text_recursive(elem).strip()
                 if text and len(text) > 30:
+                    dedup_key = text[:150]
+                    if dedup_key in seen_text_keys:
+                        continue
+                    seen_text_keys.add(dedup_key)
                     sections.append({
-                        "section_id": f"para_{section_idx}",
+                        "section_id": f"para_{para_idx}",
                         "heading": "",
                         "text": text,
                         "subsections": [],
                     })
-                    section_idx += 1
+                    para_idx += 1
 
     return sections
