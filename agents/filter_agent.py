@@ -14,6 +14,10 @@ from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event, EventActions
 from google.genai import types
 
+from tools.logging_setup import get_logger, bind_alert
+
+_log = get_logger("agents.filter")
+
 ALLOWED_PRACTICE_AREAS = frozenset({
     "banking", "finance", "banking & finance", "banking and finance",
     "b&f", "restructuring", "insolvency",
@@ -31,7 +35,9 @@ class FilterAgent(BaseAgent):
         self, ctx: InvocationContext
     ) -> AsyncGenerator[Event, None]:
         state = ctx.session.state
-        alert_meta = state.get("alert_metadata", {})
+        alert_meta = state.get("alert_metadata", {}) or {}
+        alert_id = alert_meta.get("lni_id") or "-"
+        log = bind_alert(_log, alert_id, step="filter")
 
         practice_area = (alert_meta.get("practice_area") or "").lower().strip()
 
@@ -43,6 +49,8 @@ class FilterAgent(BaseAgent):
                 reason = f"Practice area '{practice_area}' matches Banking & Finance scope"
             else:
                 reason = f"Practice area '{practice_area}' -- proceeding anyway (POC-1)"
+
+        log.info("decision should_process=%s reason=%s", should_process, reason)
 
         state["should_process"] = should_process
 

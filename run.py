@@ -23,6 +23,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Initialise structured logging before the agents import their loggers
+from tools.logging_setup import setup_logging, get_logger  # noqa: E402
+setup_logging()
+_log = get_logger("run")
+
 DATA_DIR = Path(__file__).resolve().parent / "data"
 GT_PATH = DATA_DIR / "ground_truth.json"
 
@@ -106,6 +111,8 @@ async def run_pipeline(alert_xml_path: str) -> dict:
 
     print(f"\nStarting POC-1 pipeline for: {alert_xml_path}")
     print("=" * 60)
+    _log.info("pipeline start alert=%s", alert_xml_path,
+              extra={"alert_id": Path(alert_xml_path).stem, "step": "pipeline"})
 
     content = types.Content(
         role="user",

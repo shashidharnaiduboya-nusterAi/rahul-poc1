@@ -15,6 +15,10 @@ from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event, EventActions
 from google.genai import types
 
+from tools.logging_setup import get_logger, bind_alert
+
+_log = get_logger("agents.alert_ingestion")
+
 
 class AlertIngestionAgent(BaseAgent):
     """
@@ -27,8 +31,10 @@ class AlertIngestionAgent(BaseAgent):
     ) -> AsyncGenerator[Event, None]:
         state = ctx.session.state
         xml_path_str = state.get("alert_xml_path", "")
+        log = bind_alert(_log, "-", step="alert_ingestion")
 
         if not xml_path_str:
+            log.error("no alert_xml_path in session state")
             yield Event(
                 author=self.name,
                 content=types.Content(
@@ -39,6 +45,7 @@ class AlertIngestionAgent(BaseAgent):
 
         xml_path = Path(xml_path_str)
         if not xml_path.is_file():
+            log.error("alert file not found: %s", xml_path)
             yield Event(
                 author=self.name,
                 content=types.Content(
@@ -50,6 +57,8 @@ class AlertIngestionAgent(BaseAgent):
         raw_xml = xml_path.read_text(encoding="utf-8", errors="ignore")
         state["alert_raw_xml"] = raw_xml
         state["alert_xml_path"] = str(xml_path.resolve())
+
+        log.info("alert file loaded name=%s chars=%d", xml_path.name, len(raw_xml))
 
         yield Event(
             author=self.name,

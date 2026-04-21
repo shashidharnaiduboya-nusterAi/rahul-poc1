@@ -2,7 +2,6 @@
 ingest.py -- Document Pre-Indexing Pipeline (Cases + PG Docs)
 ==============================================================
 Pre-indexes BOTH court case documents AND Practical Guidance (PG) documents.
-NO paragraph-level chunking at pre-index time.
 
 For COURT CASES:
     1. Parse case XML
@@ -16,12 +15,17 @@ For PG DOCUMENTS:
     3. Save metadata to pg_docs.db (SQLite)
     4. Optionally generate retrieval profile (LLM)
     5. Embed whole document -> Qdrant 'pg_doc_index' (one point per PG doc)
+    6. Parse PG into leaf sections/paragraphs, chunk oversize sections, embed
+       each chunk -> Qdrant 'pg_chunks' (many points per PG doc) so the
+       runtime RetrievalAgent can match case paragraphs against PG paragraphs
+       rather than against a single whole-doc vector.
 
-Chunking is ONLY done at runtime by the CaseProcessingAgent when an alert arrives.
+Case-side paragraph chunking still happens at runtime in the CaseProcessingAgent.
 
-Qdrant collections (doc-level only):
+Qdrant collections:
     case_doc_index -- one point per case document
-    pg_doc_index   -- one point per PG document
+    pg_doc_index   -- one point per PG document  (doc-level summary embedding)
+    pg_chunks      -- many points per PG document (paragraph / section-level)
 """
 
 from __future__ import annotations
@@ -49,9 +53,18 @@ from qdrant_client.models import (
     MatchValue,
 )
 
-from tools.xml_parsers import parse_courtcase, parse_pgdoc, detect_doc_type
+from tools.xml_parsers import (
+    parse_courtcase,
+    parse_pgdoc,
+    parse_pgdoc_sections,
+    detect_doc_type,
+)
+from tools.chunking import chunk_text
+from tools.logging_setup import get_logger
 
 load_dotenv()
+
+log = get_logger("ingest")
 
 # ---------------------------------------------------------------------------
 # Paths & config
@@ -64,6 +77,16 @@ QDRANT_DIR = Path(os.getenv("QDRANT_PATH", str(DATA_DIR / "qdrant")))
 
 EMBED_MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
 EMBED_DIM = 1024
+
+PG_DOC_COLL = "pg_doc_index"
+PG_CHUNK_COLL = "pg_chunks"
+CASE_DOC_COLL = "case_doc_index"
+
+# Max chars for a single PG chunk.  Longer sections get subdivided with the
+# same paragraph-window algorithm used for cases (tools/chunking.py).
+PG_CHUNK_MAX_CHARS = 2_500
+PG_CHUNK_MIN_CHARS = 80
+PG_CHUNK_EMBED_BATCH = 32
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
@@ -350,6 +373,142 @@ def save_pg_metadata(doc: dict, source_file: str, on_conflict: str = "prompt") -
 
 
 # ===========================================================================
+# Qdrant: paragraph/section-level chunks for PG documents
+# ===========================================================================
+def _build_pg_chunks(doc: dict, source_file: str) -> list[dict]:
+    """
+    Produce a list of chunk dicts for a PG document.
+
+    Strategy:
+      1. ``parse_pgdoc_sections`` returns leaf-level structural sections.
+      2. Sections under ``PG_CHUNK_MAX_CHARS`` are emitted as a single chunk.
+      3. Sections above that threshold are split further with
+         :func:`tools.chunking.chunk_text` so no single embedding exceeds the
+         encoder's useful context.
+      4. If the XML has no structural sections at all, fall back to chunking
+         the joined paragraph body.
+
+    Each chunk carries its parent ``section_id`` / ``heading`` for evidence
+    surfacing at matching time.
+    """
+    doc_id = doc["doc_id"]
+    results: list[dict] = []
+    global_idx = 0
+
+    try:
+        sections = parse_pgdoc_sections(source_file)
+    except Exception as exc:
+        log.warning("parse_pgdoc_sections failed for %s: %s", doc_id, exc,
+                    extra={"step": "pg_chunk_build"})
+        sections = []
+
+    def _emit(text: str, section_id: str, heading: str) -> None:
+        nonlocal global_idx
+        text = (text or "").strip()
+        if len(text) < PG_CHUNK_MIN_CHARS:
+            return
+        results.append({
+            "chunk_index": global_idx,
+            "chunk_id": f"{doc_id}::{section_id}::c{global_idx}",
+            "section_id": section_id,
+            "heading": heading,
+            "text": text,
+        })
+        global_idx += 1
+
+    if sections:
+        for sec in sections:
+            sec_id = sec.get("section_id") or f"sec_{global_idx}"
+            heading = sec.get("heading", "") or ""
+            text = (sec.get("text") or "").strip()
+            if not text:
+                continue
+            if len(text) <= PG_CHUNK_MAX_CHARS:
+                _emit(text, sec_id, heading)
+            else:
+                for sub in chunk_text(text, doc_id=f"{doc_id}::{sec_id}"):
+                    _emit(sub.text, sec_id, heading)
+    else:
+        joined = "\n\n".join(doc.get("paragraphs", []))
+        if joined:
+            for sub in chunk_text(joined, doc_id=doc_id):
+                _emit(sub.text, "body", "")
+
+    log.info(
+        "PG chunks built doc_id=%s sections=%d chunks=%d",
+        doc_id, len(sections), len(results),
+        extra={"step": "pg_chunk_build"},
+    )
+    return results
+
+
+def save_pg_chunk_embeddings(
+    doc: dict,
+    source_file: str,
+    model: SentenceTransformer,
+) -> int:
+    """
+    Embed PG doc at paragraph/section granularity and upsert into ``pg_chunks``.
+    Returns the number of points written.  Replaces any existing points for the
+    doc first so re-ingests stay consistent.
+    """
+    doc_id = doc["doc_id"]
+    chunks = _build_pg_chunks(doc, source_file)
+    if not chunks:
+        log.warning("No chunks for PG doc %s -- skipping pg_chunks upsert",
+                    doc_id, extra={"step": "pg_chunk_embed"})
+        return 0
+
+    qc = _get_qdrant()
+    _ensure_collection(qc, PG_CHUNK_COLL)
+    if _point_exists(qc, PG_CHUNK_COLL, "doc_id", doc_id):
+        _delete_points(qc, PG_CHUNK_COLL, "doc_id", doc_id)
+
+    texts = [c["text"][:4_000] for c in chunks]  # safety clip per chunk
+    vectors = model.encode(
+        texts,
+        show_progress_bar=False,
+        batch_size=PG_CHUNK_EMBED_BATCH,
+    )
+
+    points: list[PointStruct] = []
+    for c, vec in zip(chunks, vectors):
+        payload = {
+            "doc_id": doc_id,
+            "chunk_id": c["chunk_id"],
+            "chunk_index": c["chunk_index"],
+            "section_id": c["section_id"],
+            "heading": c["heading"],
+            "text_preview": c["text"][:400],
+            "text": c["text"][:4_000],
+            "doc_title": doc.get("doc_title", ""),
+            "practice_area": doc.get("practice_area", ""),
+            "jurisdiction": doc.get("jurisdiction", ""),
+            "cite_ids": doc.get("cite_ids", []),
+        }
+        points.append(
+            PointStruct(
+                id=str(uuid.uuid4()),
+                vector=vec.tolist(),
+                payload=payload,
+            )
+        )
+
+    # Upsert in reasonable batches.
+    BATCH = 128
+    for i in range(0, len(points), BATCH):
+        qc.upsert(collection_name=PG_CHUNK_COLL, points=points[i: i + BATCH])
+
+    log.info(
+        "pg_chunks upserted doc_id=%s points=%d",
+        doc_id, len(points),
+        extra={"step": "pg_chunk_embed"},
+    )
+    print(f"  [PGChunks] {len(points)} chunks -> Qdrant '{PG_CHUNK_COLL}'")
+    return len(points)
+
+
+# ===========================================================================
 # Qdrant: document-level embeddings (NO chunking)
 # ===========================================================================
 def save_doc_embedding(
@@ -431,6 +590,8 @@ def process(
     pg_output_dir: Path,
     on_conflict: str = "prompt",
     skip_ai: bool = False,
+    rebuild_chunks_only: bool = False,
+    model: Optional[SentenceTransformer] = None,
 ) -> None:
     xml_path = Path(xml_path)
     print(f"\n{'=' * 60}")
@@ -447,15 +608,22 @@ def process(
 
     print(f"  Type: {doc_type.upper().replace('_', ' ')}")
 
-    hf_token = os.getenv("HF_TOKEN", None)
-    model = SentenceTransformer(
-        EMBED_MODEL_NAME, trust_remote_code=True, token=hf_token,
-    )
+    if model is None:
+        hf_token = os.getenv("HF_TOKEN", None)
+        model = SentenceTransformer(
+            EMBED_MODEL_NAME, trust_remote_code=True, token=hf_token,
+        )
 
     if doc_type == "court_case":
+        if rebuild_chunks_only:
+            print("  --rebuild-chunks ignored for court case (no case chunks pre-indexed)")
+            return
         _process_court_case(xml_path, cc_output_dir, on_conflict, model)
     else:
-        _process_pg_doc(xml_path, pg_output_dir, on_conflict, skip_ai, model)
+        _process_pg_doc(
+            xml_path, pg_output_dir, on_conflict, skip_ai, model,
+            rebuild_chunks_only=rebuild_chunks_only,
+        )
 
 
 def _process_court_case(
@@ -496,8 +664,9 @@ def _process_court_case(
 def _process_pg_doc(
     xml_path: Path, output_dir: Path, on_conflict: str, skip_ai: bool,
     model: SentenceTransformer,
+    rebuild_chunks_only: bool = False,
 ) -> None:
-    """PG doc: parse, store metadata in SQLite, embed whole doc."""
+    """PG doc: parse, store metadata in SQLite, embed whole doc + chunks."""
     doc = parse_pgdoc(xml_path)
     primary_id = doc["doc_id"]
     print(f"  Doc ID      : {doc['doc_id']}")
@@ -511,12 +680,23 @@ def _process_pg_doc(
         print("  ERROR: Could not determine document ID -- skipping.")
         return
 
+    source_file = str(xml_path.resolve())
+
+    if rebuild_chunks_only:
+        # Skip metadata + doc-level embedding; just rebuild pg_chunks.
+        log.info("Rebuild chunks-only mode for %s", primary_id,
+                 extra={"step": "pg_rebuild_chunks"})
+        save_pg_chunk_embeddings(doc, source_file, model)
+        print(f"\n  Done (chunks only) -- '{primary_id}'")
+        print(f"  Qdrant -> {QDRANT_DIR}/  collection: {PG_CHUNK_COLL}")
+        return
+
     output_dir.mkdir(parents=True, exist_ok=True)
     txt_path = output_dir / f"{primary_id}.txt"
     txt_path.write_text("\n".join(doc["text_lines"]), encoding="utf-8")
     print(f"  [Text] -> {txt_path}")
 
-    inserted = save_pg_metadata(doc, str(xml_path.resolve()), on_conflict)
+    inserted = save_pg_metadata(doc, source_file, on_conflict)
     if not inserted:
         return
 
@@ -526,12 +706,15 @@ def _process_pg_doc(
         print("  [DocSummary] Generating document retrieval profile...")
         doc_summary = generate_pg_doc_summary(doc["doc_title"], doc["paragraphs"])
 
-    # Single doc-level embedding -- NO chunking at pre-index
+    # Doc-level embedding (one vector per PG doc)
     save_doc_embedding(doc, "pg_doc", model, doc_summary)
+
+    # Paragraph/section-level embeddings (many vectors per PG doc)
+    save_pg_chunk_embeddings(doc, source_file, model)
 
     print(f"\n  Done -- '{primary_id}'")
     print(f"  SQLite -> {PG_DB_PATH} (metadata)")
-    print(f"  Qdrant -> {QDRANT_DIR}/  collection: pg_doc_index (1 point)")
+    print(f"  Qdrant -> {QDRANT_DIR}/  collections: {PG_DOC_COLL} + {PG_CHUNK_COLL}")
 
 
 def process_batch(
@@ -540,6 +723,7 @@ def process_batch(
     pg_output_dir: Path,
     on_conflict: str = "replace",
     skip_ai: bool = False,
+    rebuild_chunks_only: bool = False,
 ) -> dict:
     """Process all XML files in a directory. Returns stats dict."""
     xml_files = sorted(
@@ -553,7 +737,15 @@ def process_batch(
 
     print(f"\n{'=' * 60}")
     print(f"  BATCH INGESTION: {len(xml_files)} XML files from {batch_dir}")
+    if rebuild_chunks_only:
+        print("  MODE: --rebuild-chunks (pg_chunks only)")
     print("=" * 60)
+
+    # Load the SentenceTransformer once; it's the slow step.
+    hf_token = os.getenv("HF_TOKEN", None)
+    model = SentenceTransformer(
+        EMBED_MODEL_NAME, trust_remote_code=True, token=hf_token,
+    )
 
     stats = {"total": len(xml_files), "processed": 0, "skipped": 0, "errors": 0}
 
@@ -566,10 +758,14 @@ def process_batch(
                 pg_output_dir=pg_output_dir,
                 on_conflict=on_conflict,
                 skip_ai=skip_ai,
+                rebuild_chunks_only=rebuild_chunks_only,
+                model=model,
             )
             stats["processed"] += 1
         except Exception as exc:
             print(f"  ERROR: {exc}")
+            log.exception("batch error on %s", xml_path,
+                          extra={"step": "batch"})
             stats["errors"] += 1
 
     print(f"\n{'=' * 60}")
@@ -610,6 +806,13 @@ def main() -> None:
         action="store_true",
         help="Skip OpenAI doc-level summary generation for PG docs.",
     )
+    ap.add_argument(
+        "--rebuild-chunks",
+        action="store_true",
+        help=("Only (re)build the pg_chunks collection for PG docs. "
+              "Skips metadata + doc-level embedding. Useful when you want to "
+              "roll paragraph-level embeddings out over an existing corpus."),
+    )
     args = ap.parse_args()
 
     if args.batch_dir:
@@ -624,6 +827,7 @@ def main() -> None:
             pg_output_dir=Path(args.pg_output_dir),
             on_conflict=conflict,
             skip_ai=args.no_ai_summary,
+            rebuild_chunks_only=args.rebuild_chunks,
         )
     elif args.xml_file:
         xml_path = Path(args.xml_file)
@@ -636,6 +840,7 @@ def main() -> None:
             pg_output_dir=Path(args.pg_output_dir),
             on_conflict=args.on_conflict,
             skip_ai=args.no_ai_summary,
+            rebuild_chunks_only=args.rebuild_chunks,
         )
     else:
         ap.print_help()

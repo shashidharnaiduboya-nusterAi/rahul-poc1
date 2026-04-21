@@ -77,3 +77,49 @@ def encode_single_as_query(text: str) -> list[float]:
     """Encode a single query text with the 'query' prompt. Returns list of floats."""
     model = get_embed_model()
     return model.encode(text[:16_000], prompt_name="query").tolist()
+
+
+def encode_long_text_as_query(
+    text: str,
+    window_chars: int = 8_000,
+    overlap_chars: int = 1_000,
+    max_windows: int = 12,
+) -> list[float]:
+    """
+    Encode a long document as a single pooled query vector.
+
+    Strategy:
+      1. Split ``text`` into overlapping windows of ``window_chars`` characters
+         with ``overlap_chars`` overlap, cap at ``max_windows`` to bound cost.
+      2. Encode each window with the 'query' prompt via
+         :func:`encode_texts_as_query`.
+      3. L2-normalise each window vector, mean-pool, then L2-normalise again
+         so cosine search behaves well.
+
+    Returns a list of ``EMBED_DIM`` floats.  Falls back to
+    :func:`encode_single_as_query` when the text fits in a single window.
+    """
+    text = text or ""
+    if not text:
+        return [0.0] * EMBED_DIM
+
+    if len(text) <= window_chars:
+        return encode_single_as_query(text)
+
+    stride = max(window_chars - overlap_chars, 1)
+    windows: list[str] = []
+    i = 0
+    while i < len(text) and len(windows) < max_windows:
+        windows.append(text[i: i + window_chars])
+        i += stride
+
+    vecs = encode_texts_as_query(windows)  # shape (N, D)
+    # L2 normalise each row
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    normed = vecs / norms
+    pooled = normed.mean(axis=0)
+    pooled_norm = np.linalg.norm(pooled)
+    if pooled_norm == 0:
+        return pooled.tolist()
+    return (pooled / pooled_norm).tolist()

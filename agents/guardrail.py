@@ -19,7 +19,10 @@ from google.adk.events import Event, EventActions
 from google.genai import types
 
 from tools.llm_helper import call_llm_json
+from tools.logging_setup import get_logger, bind_alert
 from prompts.guardrail import GUARDRAIL_SYSTEM, GUARDRAIL_USER_TEMPLATE
+
+_log = get_logger("agents.guardrail")
 
 
 def _build_case_excerpts(candidates: list[dict], case_chunks: list[dict]) -> str:
@@ -58,13 +61,17 @@ class GuardrailAgent(BaseAgent):
     ) -> AsyncGenerator[Event, None]:
         state = ctx.session.state
 
-        candidates = state.get("candidate_pg_docs", [])
-        case_chunks = state.get("case_chunks", [])
+        candidates = state.get("candidate_pg_docs", []) or []
+        case_chunks = state.get("case_chunks", []) or []
         case_summary = state.get("case_doc_summary", "")
         case_citation = (state.get("case_citation", "")
                          or state.get("case_cite_ref", ""))
+        alert_meta = state.get("alert_metadata", {}) or {}
+        alert_id = alert_meta.get("lni_id") or state.get("case_id") or "-"
+        log = bind_alert(_log, alert_id, step="guardrail")
 
         if not candidates:
+            log.warning("no candidates to filter")
             yield Event(
                 author=self.name,
                 content=types.Content(
@@ -73,9 +80,9 @@ class GuardrailAgent(BaseAgent):
             )
             return
 
-        # Guardrail disabled — pass all candidates through to matching
+        # Guardrail currently disabled — pass all candidates through to matching
         filtered = list(candidates)
-        print(f"  [Guardrail] Passing all {len(filtered)} candidates through (guardrail disabled)")
+        log.info("passing %d candidates through (guardrail disabled)", len(filtered))
 
         state["candidate_pg_docs"] = filtered
 

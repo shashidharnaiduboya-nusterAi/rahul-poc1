@@ -16,7 +16,10 @@ from google.adk.events import Event, EventActions
 from google.genai import types
 
 from tools.llm_helper import call_llm_json
+from tools.logging_setup import get_logger, bind_alert
 from prompts.reasoning import REASONING_SYSTEM, REASONING_USER_TEMPLATE
+
+_log = get_logger("agents.reasoning")
 
 
 def _format_evidence_for_reasoning(
@@ -56,13 +59,17 @@ class ReasoningAgent(BaseAgent):
     ) -> AsyncGenerator[Event, None]:
         state = ctx.session.state
 
-        match_reports = state.get("match_reports", [])
-        case_chunks = state.get("case_chunks", [])
+        match_reports = state.get("match_reports", []) or []
+        case_chunks = state.get("case_chunks", []) or []
         case_summary = state.get("case_doc_summary", "")
         case_citation = (state.get("case_citation", "")
                          or state.get("case_cite_ref", ""))
+        alert_meta = state.get("alert_metadata", {}) or {}
+        alert_id = alert_meta.get("lni_id") or state.get("case_id") or "-"
+        log = bind_alert(_log, alert_id, step="reasoning")
 
         if not match_reports:
+            log.warning("no matched sections to reason over")
             yield Event(
                 author=self.name,
                 content=types.Content(
@@ -74,18 +81,21 @@ class ReasoningAgent(BaseAgent):
         all_suggestions: list[dict] = []
         total_suggestions = 0
 
+        log.info("starting reasoning over %d match reports", len(match_reports))
+
         for report_idx, report in enumerate(match_reports):
             pg_doc_id = report["pg_doc_id"]
             pg_doc_title = report.get("pg_doc_title", "")
             matched_sections = report.get("matched_sections", [])
 
-            print(f"  [ReasoningAgent] [{report_idx + 1}/{len(match_reports)}] "
-                  f"{pg_doc_id}: {len(matched_sections)} sections")
+            log.info("[%d/%d] doc=%s sections=%d",
+                     report_idx + 1, len(match_reports),
+                     pg_doc_id, len(matched_sections))
 
             evidence_text = _format_evidence_for_reasoning(report, case_chunks)
 
             if evidence_text.startswith("(No specific") or evidence_text.startswith("(No matched"):
-                print(f"  [ReasoningAgent]   No paragraph evidence -- skipping")
+                log.warning("  no paragraph evidence -- skipping doc=%s", pg_doc_id)
                 continue
 
             doc_suggestions: list[dict] = []
@@ -133,8 +143,10 @@ class ReasoningAgent(BaseAgent):
                                 words = where_quote.lower().split()
                                 overlap = sum(1 for w in words if w in sec_text_lower)
                                 if len(words) > 3 and overlap / len(words) < 0.5:
-                                    print(f"  [ReasoningAgent]   {section['section_id']}: "
-                                          f"grounding failed — quoted text not in PG section")
+                                    log.warning(
+                                        "  grounding failed section=%s -- quoted text not in PG section",
+                                        section["section_id"],
+                                    )
                                     continue
                         doc_suggestions.append({
                             "section_id": section["section_id"],
@@ -146,12 +158,12 @@ class ReasoningAgent(BaseAgent):
                         })
                         total_suggestions += 1
                     else:
-                        print(f"  [ReasoningAgent]   {section['section_id']}: "
-                              f"no substantive suggestion")
+                        log.info("  section=%s no substantive suggestion",
+                                 section["section_id"])
 
                 except (json.JSONDecodeError, Exception) as exc:
-                    print(f"  [ReasoningAgent]   LLM error on "
-                          f"{section['section_id']}: {exc}")
+                    log.error("  LLM error on section=%s: %s",
+                              section["section_id"], exc)
 
             if doc_suggestions:
                 all_suggestions.append({
@@ -160,13 +172,16 @@ class ReasoningAgent(BaseAgent):
                     "source_file": report.get("source_file", ""),
                     "section_suggestions": doc_suggestions,
                 })
-                print(f"  [ReasoningAgent]   {len(doc_suggestions)} sections "
-                      f"with substantive suggestions kept")
+                log.info("  kept %d sections with substantive suggestions",
+                         len(doc_suggestions))
             else:
-                print(f"  [ReasoningAgent]   No substantive suggestions -- "
-                      f"PG doc filtered out")
+                log.info("  no substantive suggestions -- doc filtered out")
 
         state["suggestions"] = all_suggestions
+        log.info(
+            "reasoning done total_raw=%d docs_with_suggestions=%d",
+            total_suggestions, len(all_suggestions),
+        )
 
         summary = (
             f"Reasoning complete: {total_suggestions} raw suggestions, "

@@ -19,6 +19,9 @@ from google.adk.events import Event, EventActions
 from google.genai import types
 
 from tools.xml_parsers import parse_alert
+from tools.logging_setup import get_logger, bind_alert
+
+_log = get_logger("agents.alert_processing")
 
 _KEY_HOLDINGS_SYSTEM = """\
 You are a legal analyst. Given the text of a case news alert, extract:
@@ -59,8 +62,10 @@ class AlertProcessingAgent(BaseAgent):
     ) -> AsyncGenerator[Event, None]:
         state = ctx.session.state
         xml_path = state.get("alert_xml_path", "")
+        log = bind_alert(_log, "-", step="alert_processing")
 
         if not xml_path:
+            log.error("no alert_xml_path in state")
             yield Event(
                 author=self.name,
                 content=types.Content(
@@ -85,6 +90,22 @@ class AlertProcessingAgent(BaseAgent):
             "key_phrases": [],
         }
 
+        # Rebind logger with alert_id now that we know it
+        alert_id = alert_metadata["lni_id"] or "-"
+        log = bind_alert(_log, alert_id, step="alert_processing")
+        log.info(
+            "alert parsed lni=%s cite_defs=%d cite_refs=%d practice_area=%r "
+            "news_summary_chars=%d xml_holdings=%d",
+            alert_metadata["lni_id"],
+            len(alert_metadata["cite_defs"]),
+            len(alert_metadata["cite_refs"]),
+            alert_metadata["practice_area"],
+            len(alert_metadata["news_summary"]),
+            len(alert_metadata["key_holdings"]),
+        )
+        log.debug("cite_defs=%s cite_refs=%s",
+                  alert_metadata["cite_defs"], alert_metadata["cite_refs"])
+
         # Enrich with LLM-based key holdings extraction
         news_summary = alert_metadata["news_summary"]
         if news_summary and len(news_summary) > 50:
@@ -108,12 +129,19 @@ class AlertProcessingAgent(BaseAgent):
                     alert_metadata["key_phrases"] = parsed.get("key_phrases", [])
                     if parsed.get("summary"):
                         alert_metadata["llm_summary"] = parsed["summary"]
-                    print(f"  [AlertProcessing] LLM extracted {len(llm_holdings)} holdings, {len(alert_metadata['key_phrases'])} phrases")
+                    log.info(
+                        "LLM extracted holdings=%d phrases=%d",
+                        len(llm_holdings),
+                        len(alert_metadata["key_phrases"]),
+                    )
             except Exception as exc:
-                print(f"  [AlertProcessing] LLM extraction failed: {exc}")
-                print(f"  [AlertProcessing]   (XML-based holdings still available: {len(alert_metadata['key_holdings'])})")
+                log.warning(
+                    "LLM extraction failed: %s (xml_holdings still available: %d)",
+                    exc, len(alert_metadata["key_holdings"]),
+                )
         else:
-            print(f"  [AlertProcessing] News summary too short ({len(news_summary)} chars) -- using XML-based holdings only")
+            log.info("news summary too short (%d chars) -- xml holdings only",
+                     len(news_summary))
 
         state["alert_metadata"] = alert_metadata
 

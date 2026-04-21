@@ -17,6 +17,10 @@ from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event, EventActions
 from google.genai import types
 
+from tools.logging_setup import get_logger, bind_alert
+
+_log = get_logger("agents.report")
+
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "data" / "reports"
 
 
@@ -32,7 +36,9 @@ class ReportAgent(BaseAgent):
     ) -> AsyncGenerator[Event, None]:
         state = ctx.session.state
 
-        alert_meta = state.get("alert_metadata", {})
+        alert_meta = state.get("alert_metadata", {}) or {}
+        alert_id = alert_meta.get("lni_id") or state.get("case_id") or "-"
+        log = bind_alert(_log, alert_id, step="report")
         case_id = state.get("case_id", "unknown")
         case_summary = state.get("case_doc_summary", "")
         candidate_count = len(state.get("candidate_pg_docs", []))
@@ -125,9 +131,17 @@ class ReportAgent(BaseAgent):
             report_path = REPORTS_DIR / f"{safe_id}_{ts}.json"
             with open(report_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2, ensure_ascii=False)
-            print(f"  [Report] JSON saved -> {report_path}")
+            log.info("JSON saved path=%s", report_path)
         except Exception as exc:
-            print(f"  [Report] Failed to save JSON: {exc}")
+            log.error("failed to save JSON: %s", exc)
+
+        log.info(
+            "report generated candidates=%d matches=%d suggestions=%d sections=%d",
+            candidate_count,
+            len(match_reports),
+            len(suggestions),
+            sum(len(s.get("section_suggestions", [])) for s in suggestions),
+        )
 
         # Format human-readable report
         lines = [
